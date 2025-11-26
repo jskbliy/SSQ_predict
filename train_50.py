@@ -25,13 +25,27 @@ def main():
     # 步骤3: 预测下一期
     print("\n步骤3: 预测下一期号码...")
     print("-" * 60)
-    prediction = model.predict_next()
+    predictions = model.predict_next()
     
+    # 新的返回格式包含三种策略的结果
     print("\n" + "=" * 60)
-    print("预测结果:")
+    print("预测结果汇总:")
     print("=" * 60)
-    print(f"红球: {prediction['红球']}")
-    print(f"蓝球: {prediction['蓝球']}")
+    
+    # 显示三种策略的结果
+    for strategy_name, result in predictions.items():
+        print(f"\n{strategy_name}:")
+        print(f"  红球: {result['红球']}")
+        print(f"  蓝球: {result['蓝球']}")
+        print(f"  说明: {result['说明']}")
+    
+    # 默认推荐使用策略2（贪心选择）
+    recommended = predictions.get('策略2_贪心选择', list(predictions.values())[0])
+    print("\n" + "=" * 60)
+    print("推荐使用（策略2：贪心选择）:")
+    print("=" * 60)
+    print(f"红球: {recommended['红球']}")
+    print(f"蓝球: {recommended['蓝球']}")
     print("=" * 60)
     print("\n提示: 此预测仅供参考，彩票开奖具有随机性，请理性投注！")
 

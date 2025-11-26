@@ -13,6 +13,7 @@ from tensorflow.keras.callbacks import EarlyStopping, ModelCheckpoint, ReduceLRO
 from tensorflow.keras import backend as K
 import pickle
 import os
+from itertools import combinations
 from sklearn.metrics import mean_squared_error, mean_absolute_error
 from sklearn.preprocessing import MinMaxScaler
 
@@ -867,9 +868,11 @@ class SSQLSTMModel50:
         # 预测
         predictions = self.model.predict(sequence, verbose=0)
         
-        # 处理预测结果（与原来的predict_next相同的逻辑）
+        # 处理预测结果
         if self.use_classification:
-            print("\n预测概率信息:")
+            print("\n" + "=" * 60)
+            print("预测概率信息:")
+            print("=" * 60)
             for i in range(6):
                 prob_dist = predictions[i][0]
                 top5_indices = np.argsort(prob_dist)[-5:][::-1]
@@ -879,60 +882,147 @@ class SSQLSTMModel50:
                     print(f"{idx+1}({prob:.3f}) ", end="")
                 print()
             
-            red_balls = []
-            for i in range(6):
-                prob_dist = predictions[i][0]
-                if use_probability_sampling:
-                    available_probs = prob_dist.copy()
-                    available_indices = np.arange(1, 34)
-                    for selected in red_balls:
-                        if selected in available_indices:
-                            idx = selected - 1
-                            available_probs[idx] = 0.0
-                    if available_probs.sum() > 0:
-                        available_probs = available_probs / available_probs.sum()
-                        ball = np.random.choice(available_indices, p=available_probs)
-                    else:
-                        ball = np.argmax(prob_dist) + 1
-                else:
-                    prob_dist_copy = prob_dist.copy()
-                    for selected in red_balls:
-                        if 1 <= selected <= 33:
-                            prob_dist_copy[selected - 1] = -np.inf
-                    ball = np.argmax(prob_dist_copy) + 1
-                red_balls.append(int(ball))
-            
-            red_balls = sorted(list(set(red_balls)))
-            
-            while len(red_balls) < 6:
-                all_probs = np.mean([predictions[i][0] for i in range(6)], axis=0)
-                for selected in red_balls:
-                    if 1 <= selected <= 33:
-                        all_probs[selected - 1] = 0.0
-                if all_probs.sum() > 0:
-                    all_probs = all_probs / all_probs.sum()
-                    if use_probability_sampling:
-                        new_ball = np.random.choice(np.arange(1, 34), p=all_probs)
-                    else:
-                        new_ball = np.argmax(all_probs) + 1
-                else:
-                    available = [x for x in range(1, 34) if x not in red_balls]
-                    if available:
-                        new_ball = available[0]
-                    else:
-                        new_ball = 1
+            # ========== 策略1：全局选择（从所有可能的6球组合中选择概率最高的）==========
+            def global_selection(predictions, top_k=1000):
+                """
+                全局选择：计算所有可能的6球组合的概率，选择概率最高的
+                由于组合数太大（C(33,6) = 1,107,568），只计算Top-K组合
+                """
+                # 获取每个位置的概率分布
+                prob_dists = [predictions[i][0] for i in range(6)]
                 
-                if new_ball not in red_balls:
-                    red_balls.append(int(new_ball))
+                # 计算每个号码在所有位置的平均概率
+                avg_probs = np.mean(prob_dists, axis=0)
+                
+                # 选择Top-K个最可能的号码
+                top_k_numbers = np.argsort(avg_probs)[-top_k:][::-1] + 1
+                
+                # 从Top-K号码中生成所有可能的6球组合
+                best_combination = None
+                best_score = -np.inf
+                
+                # 只计算前20个号码的所有组合（减少计算量）
+                top_20 = top_k_numbers[:20]
+                for combo in combinations(top_20, 6):
+                    combo = sorted(combo)
+                    # 计算这个组合的总概率
+                    score = 0
+                    for i, num in enumerate(combo):
+                        score += prob_dists[i][num - 1]
+                    # 也考虑平均概率
+                    score += np.mean([avg_probs[num - 1] for num in combo]) * 0.5
+                    
+                    if score > best_score:
+                        best_score = score
+                        best_combination = combo
+                
+                return sorted(best_combination), best_score
             
-            red_balls = sorted(red_balls[:6])
+            # ========== 策略2：贪心选择（每次选择概率最高且未选中的号码）==========
+            def greedy_selection(predictions):
+                """
+                贪心选择：每次从所有位置中选择概率最高且未选中的号码
+                """
+                red_balls = []
+                prob_dists = [predictions[i][0].copy() for i in range(6)]
+                
+                for step in range(6):
+                    best_ball = None
+                    best_prob = -np.inf
+                    best_position = -1
+                    
+                    # 遍历所有位置和所有号码
+                    for pos in range(6):
+                        for num in range(1, 34):
+                            if num not in red_balls:
+                                prob = prob_dists[pos][num - 1]
+                                # 考虑位置权重和平均概率
+                                avg_prob = np.mean([prob_dists[i][num - 1] for i in range(6)])
+                                combined_prob = prob * 0.7 + avg_prob * 0.3
+                                
+                                if combined_prob > best_prob:
+                                    best_prob = combined_prob
+                                    best_ball = num
+                                    best_position = pos
+                    
+                    if best_ball is not None:
+                        red_balls.append(best_ball)
+                        # 从所有位置中排除已选择的号码
+                        for pos in range(6):
+                            prob_dists[pos][best_ball - 1] = -np.inf
+                
+                return sorted(red_balls)
             
-            # 处理蓝球
+            # ========== 策略3：采样选择（根据概率分布采样，避免总是选最高概率）==========
+            def sampling_selection(predictions, temperature=1.0):
+                """
+                采样选择：根据概率分布进行采样
+                temperature: 温度参数，越大越随机，越小越确定
+                """
+                red_balls = []
+                prob_dists = [predictions[i][0].copy() for i in range(6)]
+                
+                for step in range(6):
+                    # 计算所有未选择号码的加权概率
+                    available_probs = np.zeros(33)
+                    for num in range(1, 34):
+                        if num not in red_balls:
+                            # 计算该号码在所有位置的概率
+                            pos_probs = [prob_dists[i][num - 1] for i in range(6)]
+                            # 使用最大值和平均值的组合
+                            available_probs[num - 1] = max(pos_probs) * 0.6 + np.mean(pos_probs) * 0.4
+                    
+                    # 应用温度缩放
+                    if available_probs.sum() > 0:
+                        available_probs = available_probs / temperature
+                        available_probs = np.exp(available_probs - np.max(available_probs))  # 数值稳定性
+                        available_probs = available_probs / available_probs.sum()
+                        
+                        # 采样
+                        ball = np.random.choice(np.arange(1, 34), p=available_probs)
+                    else:
+                        # 如果没有可用号码，随机选择
+                        available = [x for x in range(1, 34) if x not in red_balls]
+                        ball = available[0] if available else 1
+                    
+                    red_balls.append(int(ball))
+                
+                return sorted(red_balls)
+            
+            # 执行三种策略
+            print("\n" + "=" * 60)
+            print("使用三种策略进行预测:")
+            print("=" * 60)
+            
+            # 策略1：全局选择
+            print("\n【策略1：全局选择】")
+            print("从所有可能的6球组合中选择概率最高的组合...")
+            try:
+                global_red, global_score = global_selection(predictions, top_k=100)
+                print(f"✓ 全局选择结果: {global_red} (组合得分: {global_score:.4f})")
+            except Exception as e:
+                print(f"✗ 全局选择失败: {e}")
+                # 降级为贪心选择
+                global_red = greedy_selection(predictions)
+                print(f"  降级为贪心选择: {global_red}")
+            
+            # 策略2：贪心选择
+            print("\n【策略2：贪心选择】")
+            print("每次选择概率最高且未选中的号码...")
+            greedy_red = greedy_selection(predictions)
+            print(f"✓ 贪心选择结果: {greedy_red}")
+            
+            # 策略3：采样选择
+            print("\n【策略3：采样选择】")
+            print("根据概率分布进行采样（温度=1.0）...")
+            if random_seed is not None:
+                np.random.seed(random_seed)
+            sampling_red = sampling_selection(predictions, temperature=1.0)
+            print(f"✓ 采样选择结果: {sampling_red}")
+            
+            # 蓝球预测（三种策略使用相同方法：选择概率最高的）
             blue_prob_dist = predictions[6][0]
-            if use_probability_sampling:
-                blue_ball = np.random.choice(np.arange(1, 17), p=blue_prob_dist)
-            else:
-                blue_ball = np.argmax(blue_prob_dist) + 1
+            blue_ball = np.argmax(blue_prob_dist) + 1
             
             print(f"\n蓝球预测信息:")
             top5_indices = np.argsort(blue_prob_dist)[-5:][::-1]
@@ -942,6 +1032,49 @@ class SSQLSTMModel50:
                 print(f"{idx+1}({prob:.3f}) ", end="")
             print()
             print(f"  最终预测: {blue_ball} (概率: {blue_prob_dist[blue_ball-1]:.3f})")
+            
+            # 返回三种结果
+            print("\n" + "=" * 60)
+            print("三种预测策略的结果汇总:")
+            print("=" * 60)
+            print(f"\n【策略1：全局选择】")
+            print(f"  红球: {sorted(global_red)}")
+            print(f"  蓝球: {blue_ball}")
+            print(f"  说明: 从所有可能的6球组合中选择概率最高的组合")
+            print(f"  特点: 考虑整体组合概率，理论上最优")
+            
+            print(f"\n【策略2：贪心选择】")
+            print(f"  红球: {sorted(greedy_red)}")
+            print(f"  蓝球: {blue_ball}")
+            print(f"  说明: 每次选择概率最高且未选中的号码")
+            print(f"  特点: 简单高效，保证不重复")
+            
+            print(f"\n【策略3：采样选择】")
+            print(f"  红球: {sorted(sampling_red)}")
+            print(f"  蓝球: {blue_ball}")
+            print(f"  说明: 根据概率分布进行采样，避免总是选最高概率")
+            print(f"  特点: 增加随机性，可能发现更好的组合")
+            print("=" * 60)
+            print("\n提示: 请从以上三种策略中选择一个结果使用")
+            print("=" * 60)
+            
+            return {
+                '策略1_全局选择': {
+                    '红球': global_red,
+                    '蓝球': blue_ball,
+                    '说明': '从所有可能的6球组合中选择概率最高的组合'
+                },
+                '策略2_贪心选择': {
+                    '红球': greedy_red,
+                    '蓝球': blue_ball,
+                    '说明': '每次选择概率最高且未选中的号码'
+                },
+                '策略3_采样选择': {
+                    '红球': sampling_red,
+                    '蓝球': blue_ball,
+                    '说明': '根据概率分布进行采样，避免总是选最高概率'
+                }
+            }
         else:
             # 回归模式
             prediction_scaled = predictions[0] if isinstance(predictions, list) else predictions
