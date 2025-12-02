@@ -330,19 +330,37 @@ class SSQLSTMModel50:
             
             # ========== 蓝球输出层 ==========
             # 蓝球输出：分类（16个类别，1-16）
-            blue_dense = Dense(256, activation='relu', name='blue_dense1')(shared)
+            # 增强蓝球输出层：更深的网络和更大的容量，提高蓝球预测能力
+            if use_swish:
+                blue_dense = Dense(384, name='blue_dense1')(shared)
+                blue_dense = Activation(swish_activation, name='blue_act1')(blue_dense)
+            else:
+                blue_dense = Dense(384, activation='relu', name='blue_dense1')(shared)
             blue_dense = BatchNormalization(name='blue_norm1')(blue_dense)
             blue_dense = Dropout(0.3, name='blue_drop1')(blue_dense)
             
-            blue_dense2 = Dense(128, activation='relu', name='blue_dense2')(blue_dense)
+            if use_swish:
+                blue_dense2 = Dense(256, name='blue_dense2')(blue_dense)
+                blue_dense2 = Activation(swish_activation, name='blue_act2')(blue_dense2)
+            else:
+                blue_dense2 = Dense(256, activation='relu', name='blue_dense2')(blue_dense)
             blue_dense2 = BatchNormalization(name='blue_norm2')(blue_dense2)
             blue_dense2 = Dropout(0.25, name='blue_drop2')(blue_dense2)
             
-            blue_dense3 = Dense(64, activation='relu', name='blue_dense3')(blue_dense2)
+            if use_swish:
+                blue_dense3 = Dense(128, name='blue_dense3')(blue_dense2)
+                blue_dense3 = Activation(swish_activation, name='blue_act3')(blue_dense3)
+            else:
+                blue_dense3 = Dense(128, activation='relu', name='blue_dense3')(blue_dense2)
             blue_dense3 = BatchNormalization(name='blue_norm3')(blue_dense3)
             blue_dense3 = Dropout(0.2, name='blue_drop3')(blue_dense3)
             
-            blue_dense4 = Dense(32, activation='relu', name='blue_dense4')(blue_dense3)
+            if use_swish:
+                blue_dense4 = Dense(64, name='blue_dense4')(blue_dense3)
+                blue_dense4 = Activation(swish_activation, name='blue_act4')(blue_dense4)
+            else:
+                blue_dense4 = Dense(64, activation='relu', name='blue_dense4')(blue_dense3)
+            blue_dense4 = BatchNormalization(name='blue_norm4')(blue_dense4)
             blue_dense4 = Dropout(0.15, name='blue_drop4')(blue_dense4)
             
             blue_output = Dense(16, activation='softmax', name='blue_ball')(blue_dense4)
@@ -368,12 +386,14 @@ class SSQLSTMModel50:
             
             if use_focal_loss:
                 # 使用Focal Loss处理类别不平衡
-                focal_loss_fn = focal_loss(gamma=2.0, alpha=0.25)
+                # 蓝球使用更强的Focal Loss参数（更高的gamma），提高对难样本的关注
+                focal_loss_fn_red = focal_loss(gamma=2.0, alpha=0.25)
+                focal_loss_fn_blue = focal_loss(gamma=3.0, alpha=0.3)  # 蓝球使用更强的Focal Loss
                 for i in range(6):
-                    losses[f'red_ball_{i}'] = focal_loss_fn
+                    losses[f'red_ball_{i}'] = focal_loss_fn_red
                     loss_weights[f'red_ball_{i}'] = 1.0
-                losses['blue_ball'] = focal_loss_fn
-                loss_weights['blue_ball'] = 1.5  # 进一步提高蓝球权重
+                losses['blue_ball'] = focal_loss_fn_blue
+                loss_weights['blue_ball'] = 2.0  # 进一步提高蓝球权重（从1.5提高到2.0）
             elif use_label_smoothing:
                 # 使用标签平滑交叉熵
                 label_smooth_fn = label_smoothing_crossentropy(smoothing=smoothing_rate)
@@ -381,14 +401,14 @@ class SSQLSTMModel50:
                     losses[f'red_ball_{i}'] = label_smooth_fn
                     loss_weights[f'red_ball_{i}'] = 1.0
                 losses['blue_ball'] = label_smooth_fn
-                loss_weights['blue_ball'] = 1.5
+                loss_weights['blue_ball'] = 2.0  # 进一步提高蓝球权重
             else:
                 # 标准交叉熵
                 for i in range(6):
                     losses[f'red_ball_{i}'] = 'sparse_categorical_crossentropy'
                     loss_weights[f'red_ball_{i}'] = 1.0
                 losses['blue_ball'] = 'sparse_categorical_crossentropy'
-                loss_weights['blue_ball'] = 1.5
+                loss_weights['blue_ball'] = 2.0  # 进一步提高蓝球权重
             
             # 编译模型（使用优化的Adam优化器 + 学习率调度）
             # 使用余弦退火学习率
@@ -793,6 +813,11 @@ class SSQLSTMModel50:
     def predict_next(self, use_probability_sampling=False, random_seed=None, use_latest_data=True):
         """
         预测下一期号码（使用从第1期到当前期的所有历史数据）
+        
+        改进的预测策略：
+        1. 红球：使用加权平均概率 + 温度采样，避免出现等差数列或规律性号码
+        2. 蓝球：动态调整温度采样，根据概率分布集中度自动选择最佳采样策略
+        3. 增加随机性和多样性，避免总是预测相同或相似的号码
         """
         if self.model is None:
             self.load_model()
@@ -882,62 +907,140 @@ class SSQLSTMModel50:
                     print(f"{idx+1}({prob:.3f}) ", end="")
                 print()
             
-            # ========== 位置对应选择策略 ==========
-            def position_based_selection(predictions):
+            # ========== 改进的红球选择策略 ==========
+            def improved_red_ball_selection(predictions, temperature=2.5, top_k=15, seed=None):
                 """
-                位置对应选择策略：
-                1. 每个位置选择该位置概率最高的号码
-                2. 如果出现重复，选择该位置概率次高的号码
-                3. 确保最终6个号码不重复
+                改进的红球选择策略：使用加权采样增加多样性
+                1. 合并所有位置的预测概率（使用加权平均）
+                2. 使用温度采样增加随机性
+                3. 从Top-K候选中采样，确保结果多样化
                 """
                 prob_dists = [predictions[i][0].copy() for i in range(6)]
-                red_balls = []
                 
-                # 按位置顺序选择
-                for pos in range(6):
-                    prob_dist = prob_dists[pos]
+                # 使用加权平均：不同位置给予不同权重
+                # 位置越靠前，权重越大（因为通常前面的位置更稳定）
+                position_weights = np.array([0.18, 0.18, 0.16, 0.16, 0.16, 0.16])
+                position_weights = position_weights / position_weights.sum()  # 归一化
+                
+                # 计算加权平均概率
+                combined_probs = np.zeros(33)
+                for i in range(6):
+                    combined_probs += prob_dists[i] * position_weights[i]
+                
+                # 同时考虑最大概率（增加多样性）
+                max_probs = np.max(prob_dists, axis=0)
+                
+                # 混合策略：70%加权平均 + 30%最大概率
+                final_probs = 0.7 * combined_probs + 0.3 * max_probs
+                
+                # 应用温度缩放，增加随机性
+                scaled_probs = np.power(final_probs + 1e-10, 1.0 / temperature)
+                scaled_probs = scaled_probs / scaled_probs.sum()
+                
+                # 从Top-K候选中采样
+                top_k_indices = np.argsort(scaled_probs)[-top_k:][::-1]
+                top_k_probs = scaled_probs[top_k_indices]
+                top_k_probs = top_k_probs / top_k_probs.sum()
+                
+                # 采样6个不重复的号码
+                red_balls = []
+                remaining_probs = top_k_probs.copy()
+                remaining_indices = top_k_indices.copy()
+                
+                rng = np.random.RandomState(seed) if seed is not None else np.random
+                
+                for i in range(6):
+                    if len(remaining_indices) == 0:
+                        # 如果候选用完了，从全部33个号码中随机选择
+                        available = [x for x in range(1, 34) if x not in red_balls]
+                        if available:
+                            red_balls.append(rng.choice(available))
+                        break
                     
-                    # 获取该位置概率从高到低的排序
-                    sorted_indices = np.argsort(prob_dist)[::-1]
+                    # 从剩余候选中采样
+                    selected_idx = rng.choice(len(remaining_indices), p=remaining_probs)
+                    selected_ball = remaining_indices[selected_idx] + 1
                     
-                    # 选择该位置概率最高且未选中的号码
-                    selected = False
-                    for idx in sorted_indices:
-                        ball = idx + 1  # 转换为1-33
-                        if ball not in red_balls:
-                            red_balls.append(ball)
-                            selected = True
-                            break
+                    red_balls.append(selected_ball)
                     
-                    # 如果所有号码都被选过了（理论上不可能），选择概率最高的
-                    if not selected:
-                        best_ball = np.argmax(prob_dist) + 1
-                        red_balls.append(best_ball)
+                    # 移除已选择的号码
+                    mask = remaining_indices != remaining_indices[selected_idx]
+                    remaining_indices = remaining_indices[mask]
+                    remaining_probs = remaining_probs[mask]
+                    if len(remaining_probs) > 0:
+                        remaining_probs = remaining_probs / remaining_probs.sum()
                 
                 # 确保有6个不重复的号码
                 red_balls = sorted(list(set(red_balls)))
                 
-                # 如果不足6个，从所有位置的平均概率中选择补充
+                # 如果不足6个，从所有号码中补充
                 if len(red_balls) < 6:
-                    # 计算每个号码在所有位置的平均概率
-                    avg_probs = np.mean(prob_dists, axis=0)
-                    
-                    # 从高到低选择未选中的号码
-                    sorted_by_avg = np.argsort(avg_probs)[::-1]
-                    for idx in sorted_by_avg:
-                        ball = idx + 1
-                        if ball not in red_balls:
-                            red_balls.append(ball)
-                            if len(red_balls) >= 6:
-                                break
+                    available = [x for x in range(1, 34) if x not in red_balls]
+                    if len(available) >= (6 - len(red_balls)):
+                        # 从可用号码中按概率补充
+                        available_probs = scaled_probs[np.array(available) - 1]
+                        available_probs = available_probs / available_probs.sum()
+                        
+                        needed = 6 - len(red_balls)
+                        selected = rng.choice(
+                            available, 
+                            size=min(needed, len(available)), 
+                            replace=False, 
+                            p=available_probs
+                        )
+                        red_balls.extend(selected.tolist())
+                    else:
+                        # 如果还是不够，随机补充
+                        remaining = [x for x in range(1, 34) if x not in red_balls]
+                        red_balls.extend(remaining[:6 - len(red_balls)])
                 
                 return sorted(red_balls[:6])
             
-            # 使用位置对应选择策略
-            print("\n正在生成预测结果（每个位置选择概率最高的号码）...")
-            red_balls = position_based_selection(predictions)
+            # 使用改进的选择策略
+            print("\n" + "=" * 60)
+            print("红球选择策略:")
+            print("=" * 60)
+            print("  方法: 加权平均概率 + 温度采样")
+            print("  温度: 2.5 (增加随机性和多样性)")
+            print("  候选池: Top-15 号码")
+            print("  特点: 避免等差数列，增加预测多样性")
             
-            # 蓝球预测：使用改进的策略
+            # 计算合并概率用于展示
+            prob_dists = [predictions[i][0].copy() for i in range(6)]
+            position_weights = np.array([0.18, 0.18, 0.16, 0.16, 0.16, 0.16])
+            position_weights = position_weights / position_weights.sum()
+            combined_probs = np.zeros(33)
+            for i in range(6):
+                combined_probs += prob_dists[i] * position_weights[i]
+            max_probs = np.max(prob_dists, axis=0)
+            final_probs = 0.7 * combined_probs + 0.3 * max_probs
+            scaled_probs = np.power(final_probs + 1e-10, 1.0 / 2.5)
+            scaled_probs = scaled_probs / scaled_probs.sum()
+            
+            # 显示Top-15候选号码
+            top15_indices = np.argsort(scaled_probs)[-15:][::-1]
+            top15_probs = scaled_probs[top15_indices]
+            print(f"\n  合并后Top-15候选号码:")
+            for i, (idx, prob) in enumerate(zip(top15_indices, top15_probs)):
+                print(f"    {idx+1:2d}: {prob:.4f} ({prob*100:.2f}%)", end="  ")
+                if (i + 1) % 3 == 0:
+                    print()
+            if len(top15_indices) % 3 != 0:
+                print()
+            
+            red_balls = improved_red_ball_selection(predictions, temperature=2.5, top_k=15, seed=random_seed)
+            
+            # 显示最终预测结果
+            print(f"\n  最终预测的红球: {red_balls}")
+            
+            # 检查是否有规律性
+            intervals = [red_balls[i+1] - red_balls[i] for i in range(5)]
+            if len(set(intervals)) == 1:
+                print(f"  警告: 检测到等差数列 (间隔={intervals[0]})")
+            else:
+                print(f"  号码间隔: {intervals} (无规律)")
+            
+            # 蓝球预测：使用改进的策略（避免总是预测同一个号码）
             blue_prob_dist = predictions[6][0]
             
             print(f"\n蓝球预测信息:")
@@ -948,33 +1051,48 @@ class SSQLSTMModel50:
                 print(f"{idx+1}({prob:.3f}) ", end="")
             print()
             
-            # 检查概率分布是否过于集中
+            # 检查概率分布
             max_prob = np.max(blue_prob_dist)
             entropy = -np.sum(blue_prob_dist * np.log(blue_prob_dist + 1e-10))
-            max_entropy = np.log(16)  # 16个类别的最大熵
+            max_entropy = np.log(16)
             entropy_ratio = entropy / max_entropy
             
-            print(f"  概率分布熵: {entropy:.4f} (最大熵: {max_entropy:.4f}, 比例: {entropy_ratio:.2%})")
+            print(f"  概率分布熵: {entropy:.4f} (比例: {entropy_ratio:.2%})")
             print(f"  最高概率: {max_prob:.4f} ({max_prob*100:.2f}%)")
             
-            # 如果概率分布过于集中（熵太低），使用采样策略
-            # 如果概率分布较分散，使用最高概率策略
-            if entropy_ratio < 0.5 or max_prob > 0.15:
-                # 概率分布过于集中，使用Top-3采样
-                top3_indices = top5_indices[:3]
-                top3_probs = blue_prob_dist[top3_indices]
-                top3_probs = top3_probs / top3_probs.sum()  # 归一化
-                
-                if random_seed is not None:
-                    np.random.seed(random_seed)
-                blue_ball = np.random.choice(top3_indices + 1, p=top3_probs)
-                print(f"  策略: Top-3采样（概率分布过于集中）")
+            # 改进策略：使用更强的温度采样，增加多样性
+            # 动态调整温度：如果概率分布过于集中，使用更高的温度
+            if entropy_ratio < 0.4 or max_prob > 0.2:
+                # 概率分布过于集中，使用更高的温度
+                temperature = 3.5
+                top_k = 8
+                strategy_name = "高温度采样（概率分布过于集中）"
+            elif entropy_ratio < 0.6 or max_prob > 0.15:
+                # 中等集中度，使用中等温度
+                temperature = 2.5
+                top_k = 6
+                strategy_name = "中等温度采样"
             else:
-                # 概率分布较分散，使用最高概率
-                blue_ball = np.argmax(blue_prob_dist) + 1
-                print(f"  策略: 最高概率选择")
+                # 概率分布较分散，使用较低温度但仍有随机性
+                temperature = 2.0
+                top_k = 5
+                strategy_name = "温度采样（概率分布较分散）"
             
-            print(f"  最终预测: {blue_ball} (概率: {blue_prob_dist[blue_ball-1]:.3f})")
+            # 温度采样：使用温度参数调整概率分布
+            scaled_probs = np.power(blue_prob_dist + 1e-10, 1.0 / temperature)
+            scaled_probs = scaled_probs / scaled_probs.sum()
+            
+            # 从Top-K中采样（避免选择概率太低的号码）
+            top_k_indices_full = np.argsort(scaled_probs)[-top_k:][::-1]
+            top_k_scaled_probs = scaled_probs[top_k_indices_full]
+            top_k_scaled_probs = top_k_scaled_probs / top_k_scaled_probs.sum()
+            
+            if random_seed is not None:
+                np.random.seed(random_seed + 200)
+            blue_ball = np.random.choice(top_k_indices_full + 1, p=top_k_scaled_probs)
+            print(f"  策略: Top-{top_k}温度采样 (温度={temperature}, {strategy_name})")
+            
+            print(f"  最终预测: {blue_ball} (原始概率: {blue_prob_dist[blue_ball-1]:.3f}, 缩放后概率: {top_k_scaled_probs[np.where(top_k_indices_full == blue_ball-1)[0][0]]:.3f})")
             
             # 返回单个结果
             return {
