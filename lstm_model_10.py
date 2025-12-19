@@ -1,7 +1,7 @@
 """
-双色球LSTM预测模型（使用50期数据）
+双色球LSTM预测模型（使用10期数据）
 使用LSTM神经网络预测下一期双色球号码
-训练时使用50期历史数据来预测下一期
+训练时使用10期历史数据来预测下一期
 """
 import numpy as np
 import pandas as pd
@@ -116,9 +116,9 @@ class MeanTeacherCallback(Callback):
 
 
 
-class SSQLSTMModel50:
+class SSQLSTMModel10:
     """
-    使用50期数据训练的LSTM模型
+    使用10期数据训练的LSTM模型
     """
     def __init__(self, model_file="ssq_lstm_model_50.weights.h5", use_mean_teacher=True, teacher_alpha=0.99, use_classification=True):
         if not model_file.endswith(".weights.h5"):
@@ -126,19 +126,19 @@ class SSQLSTMModel50:
             model_file = f"{base}.weights.h5"
         self.model_file = model_file
         self.scaler_file = "scaler.pkl"
-        self.processed_data_file = "processed_data_50.npz"  # 使用50期的数据文件
+        self.processed_data_file = "processed_data_10.npz"  # 使用10期的数据文件
         self.data_file = "ssq_history.csv"
         self.model = None
         self.teacher_model = None
         self.use_mean_teacher = use_mean_teacher
         self.teacher_alpha = teacher_alpha
         self.use_classification = use_classification
-        self.seq_length = 50  # 使用50期数据
+        self.seq_length = None  # 从数据文件读取
         
     def load_data(self):
         """加载处理后的数据（50期）"""
         if not os.path.exists(self.processed_data_file):
-            raise FileNotFoundError(f"处理后的数据文件不存在，请先运行 data_processor.py 处理数据（seq_length=50）")
+            raise FileNotFoundError(f"处理后的数据文件不存在，请先运行 data_processor.py 处理数据（seq_length=10）")
         
         data = np.load(self.processed_data_file, allow_pickle=True)
         X_train = data['X_train']
@@ -147,9 +147,9 @@ class SSQLSTMModel50:
         y_test = data['y_test']
         seq_length = int(data['seq_length'])
         
-        if seq_length != 50:
-            print(f"警告: 数据文件中的seq_length是{seq_length}，不是50。请重新处理数据。")
-        
+        # 保存序列长度
+        self.seq_length = seq_length
+        print(f"从数据文件读取序列长度: {seq_length} 期")
         print(f"训练集: {X_train.shape}, 测试集: {X_test.shape}")
         
         # 如果使用分类模式，需要转换标签格式
@@ -203,7 +203,7 @@ class SSQLSTMModel50:
     
     def build_model(self, input_shape, use_classification=True):
         """
-        构建优化的LSTM模型（使用50期数据）
+        构建优化的LSTM模型（使用10期数据）
         优化点：
         1. 更深的网络结构（4层LSTM）
         2. 多层注意力机制
@@ -457,13 +457,13 @@ class SSQLSTMModel50:
     
     def train(self, epochs=200, batch_size=24, validation_split=0.2):
         """
-        训练优化的LSTM模型（使用50期数据）
+        训练优化的LSTM模型（使用10期数据）
         优化点：
         1. 增加训练轮数（200轮）
         2. 优化批次大小（24，更好的梯度估计）
         3. 改进回调函数策略
         """
-        print("开始训练优化的LSTM模型（使用50期数据）...")
+        print("开始训练优化的LSTM模型（使用10期数据）...")
         print("=" * 60)
         print("优化配置:")
         print(f"  - 训练轮数: {epochs}")
@@ -645,7 +645,7 @@ class SSQLSTMModel50:
         
         # 加载权重
         self.model.load_weights(self.model_file)
-        print(f"模型已从 {self.model_file} 加载（使用50期数据）")
+        print(f"模型已从 {self.model_file} 加载（使用10期数据）")
         
         return self.model
     
@@ -812,7 +812,7 @@ class SSQLSTMModel50:
     
     def predict_next(self, use_probability_sampling=False, random_seed=None, use_latest_data=True):
         """
-        预测下一期号码（使用从第1期到当前期的所有历史数据）
+        预测下一期号码（使用最近10期数据）
         """
         if self.model is None:
             self.load_model()
@@ -843,39 +843,35 @@ class SSQLSTMModel50:
             
             features_scaled = scaler.transform(features)
             
-            # 使用从第1期到当前期的所有数据
-            actual_seq_length = len(features_scaled)
-            
-            # 从processed_data.npz获取模型训练时的最大序列长度
+            # 从processed_data_10.npz获取模型训练时的序列长度
             if os.path.exists(self.processed_data_file):
                 data = np.load(self.processed_data_file, allow_pickle=True)
                 model_seq_length = int(data['seq_length'])
             else:
-                model_seq_length = actual_seq_length
+                model_seq_length = 10  # 默认10期
             
-            # 如果实际数据长度小于模型需要的长度，用最早的数据填充
-            if actual_seq_length < model_seq_length:
-                padding_needed = model_seq_length - actual_seq_length
+            # 使用最近10期数据
+            if len(features_scaled) < model_seq_length:
+                # 如果数据不足，用最早的数据填充
+                padding_needed = model_seq_length - len(features_scaled)
                 padding = np.tile(features_scaled[0:1], (padding_needed, 1))
                 features_scaled = np.vstack([padding, features_scaled])
-                print(f"警告: 数据不足，使用 {actual_seq_length} 期数据 + {padding_needed} 期填充")
-            elif actual_seq_length > model_seq_length:
-                # 如果实际数据长度大于模型需要的长度，只使用最近的model_seq_length期
-                features_scaled = features_scaled[-model_seq_length:]
-                print(f"注意: 数据有 {actual_seq_length} 期，模型使用最近 {model_seq_length} 期")
+                print(f"警告: 数据不足，使用 {len(features_scaled) - padding_needed} 期数据 + {padding_needed} 期填充")
             else:
-                print(f"使用所有 {actual_seq_length} 期数据进行预测")
+                # 只使用最近10期
+                features_scaled = features_scaled[-model_seq_length:]
+                print(f"使用最近 {model_seq_length} 期数据进行预测")
             
-            # 显示用于预测的数据（显示最近20期，如果数据少于20期则显示全部）
-            display_count = min(20, len(df))
-            print(f"\n用于预测的数据（显示最近 {display_count} 期）:")
-            for i in range(max(0, len(df) - display_count), len(df)):
+            # 显示用于预测的数据（显示最近10期）
+            print(f"\n用于预测的数据（最近 {model_seq_length} 期）:")
+            start_idx = max(0, len(df) - model_seq_length)
+            for i in range(start_idx, len(df)):
                 red = [df.iloc[i][f'红球{j+1}'] for j in range(6)]
                 blue = df.iloc[i]['蓝球']
                 period = df.iloc[i]['期号'] if '期号' in df.columns else f"第{i+1}期"
                 print(f"  {period}: 红球{red}, 蓝球{blue}")
             
-            sequence = features_scaled.reshape(1, len(features_scaled), -1)
+            sequence = features_scaled.reshape(1, model_seq_length, -1)
         else:
             if not os.path.exists(self.processed_data_file):
                 raise FileNotFoundError(f"处理后的数据文件不存在")
@@ -1049,10 +1045,10 @@ class SSQLSTMModel50:
 
 
 if __name__ == "__main__":
-    model = SSQLSTMModel50()
+    model = SSQLSTMModel10()
     
     # 训练模型
-    print("开始训练（使用50期数据）...")
+    print("开始训练（使用10期数据）...")
     model.train(epochs=200, batch_size=32)
     
     # 预测下一期
