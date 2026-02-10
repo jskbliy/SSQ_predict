@@ -13,6 +13,7 @@ from tensorflow.keras.callbacks import EarlyStopping, ModelCheckpoint, ReduceLRO
 from tensorflow.keras import backend as K
 import pickle
 import os
+import time
 from itertools import combinations
 from sklearn.metrics import mean_squared_error, mean_absolute_error
 from sklearn.preprocessing import MinMaxScaler
@@ -120,7 +121,7 @@ class SSQLSTMModel10:
     """
     使用10期数据训练的LSTM模型
     """
-    def __init__(self, model_file="ssq_lstm_model_50.weights.h5", use_mean_teacher=True, teacher_alpha=0.99, use_classification=True):
+    def __init__(self, model_file="ssq_lstm_model_10.weights.h5", use_mean_teacher=True, teacher_alpha=0.99, use_classification=True):
         if not model_file.endswith(".weights.h5"):
             base, _ = os.path.splitext(model_file)
             model_file = f"{base}.weights.h5"
@@ -621,8 +622,8 @@ class SSQLSTMModel10:
 
         # 保存训练历史
         history_df = pd.DataFrame(history.history)
-        history_df.to_csv("training_history_50.csv", index=False)
-        print("训练历史已保存到 training_history_50.csv")
+        history_df.to_csv("training_history_10.csv", index=False)
+        print("训练历史已保存到 training_history_10.csv")
 
         # 保存最终模型权重
         self.model.save_weights(self.model_file)
@@ -636,6 +637,8 @@ class SSQLSTMModel10:
         if not os.path.exists(self.model_file):
             raise FileNotFoundError(f"模型文件 {self.model_file} 不存在，请先训练模型")
         
+        print(f"\n正在加载模型权重: {self.model_file}")
+        
         # 加载数据以获取input_shape
         X_train, _, _, _, _ = self.load_data()
         input_shape = (X_train.shape[1], X_train.shape[2])
@@ -645,7 +648,16 @@ class SSQLSTMModel10:
         
         # 加载权重
         self.model.load_weights(self.model_file)
-        print(f"模型已从 {self.model_file} 加载（使用10期数据）")
+        
+        # 获取权重文件的修改时间
+        import datetime
+        mtime = os.path.getmtime(self.model_file)
+        mtime_str = datetime.datetime.fromtimestamp(mtime).strftime('%Y-%m-%d %H:%M:%S')
+        
+        print(f"✓ 模型已从 {self.model_file} 加载")
+        print(f"  模型文件最后修改时间: {mtime_str}")
+        print(f"  注意: 如果模型文件是旧的，预测结果不会随数据更新而变化！")
+        print(f"  要获得基于最新数据的预测，请重新训练模型。")
         
         return self.model
     
@@ -813,9 +825,16 @@ class SSQLSTMModel10:
     def predict_next(self, use_probability_sampling=False, random_seed=None, use_latest_data=True):
         """
         预测下一期号码（使用最近10期数据）
+        
+        重要说明：
+        - 此方法使用已训练的模型进行预测
+        - 即使CSV数据更新，如果模型权重未更新，预测结果也不会变化
+        - 要获得基于最新数据的预测，需要重新训练模型（运行 train_10.py）
         """
         if self.model is None:
             self.load_model()
+        else:
+            print(f"\n使用已加载的模型: {self.model_file}")
         
         if random_seed is not None:
             np.random.seed(random_seed)
@@ -823,8 +842,14 @@ class SSQLSTMModel10:
         # 加载数据
         if use_latest_data and os.path.exists(self.data_file):
             print("从CSV文件读取最新数据...")
+            # 强制重新读取文件，不使用缓存
             df = pd.read_csv(self.data_file, encoding='utf-8-sig')
-            df = df.sort_values('期号', ascending=True)
+            
+            # 去除重复数据（如果有）
+            if '期号' in df.columns:
+                df = df.drop_duplicates(subset=['期号'], keep='last')
+            
+            df = df.sort_values('期号', ascending=True).reset_index(drop=True)
             
             print(f"数据总期数: {len(df)}")
             if len(df) > 0:
@@ -833,6 +858,30 @@ class SSQLSTMModel10:
                 latest_blue = df.iloc[-1]['蓝球']
                 print(f"最新开奖: 红球{latest_red}, 蓝球{latest_blue}")
             
+            # 从processed_data_10.npz获取模型训练时的序列长度
+            if os.path.exists(self.processed_data_file):
+                data = np.load(self.processed_data_file, allow_pickle=True)
+                model_seq_length = int(data['seq_length'])
+            else:
+                model_seq_length = 10  # 默认10期
+            
+            # 确保至少有10期数据
+            if len(df) < model_seq_length:
+                raise ValueError(f"数据不足，需要至少 {model_seq_length} 期数据，当前只有 {len(df)} 期")
+            
+            # 显示用于预测的数据（最近10期，不重复）
+            print(f"\n用于预测的数据（最近 {model_seq_length} 期）:")
+            start_idx = len(df) - model_seq_length
+            df_recent = df.iloc[start_idx:].copy()
+            for idx, row in df_recent.iterrows():
+                red = [row[f'红球{i+1}'] for i in range(6)]
+                blue = row['蓝球']
+                period = row['期号'] if '期号' in row else f"第{idx+1}期"
+                print(f"  {period}: 红球{red}, 蓝球{blue}")
+            
+            # 对全部历史数据计算特征（这样频率特征、趋势特征才能正确计算）
+            # 然后只取最近10期的特征用于预测
+            print(f"\n正在计算特征（基于全部 {len(df)} 期历史数据）...")
             features = self._prepare_features_from_csv(df)
             
             if not os.path.exists(self.scaler_file):
@@ -843,35 +892,42 @@ class SSQLSTMModel10:
             
             features_scaled = scaler.transform(features)
             
-            # 从processed_data_10.npz获取模型训练时的序列长度
-            if os.path.exists(self.processed_data_file):
-                data = np.load(self.processed_data_file, allow_pickle=True)
-                model_seq_length = int(data['seq_length'])
-            else:
-                model_seq_length = 10  # 默认10期
+            # 只取最近10期的特征用于预测
+            features_recent = features_scaled[-model_seq_length:]
             
-            # 使用最近10期数据
-            if len(features_scaled) < model_seq_length:
-                # 如果数据不足，用最早的数据填充
-                padding_needed = model_seq_length - len(features_scaled)
-                padding = np.tile(features_scaled[0:1], (padding_needed, 1))
-                features_scaled = np.vstack([padding, features_scaled])
-                print(f"警告: 数据不足，使用 {len(features_scaled) - padding_needed} 期数据 + {padding_needed} 期填充")
-            else:
-                # 只使用最近10期
-                features_scaled = features_scaled[-model_seq_length:]
-                print(f"使用最近 {model_seq_length} 期数据进行预测")
+            # 打印详细的特征摘要以便调试
+            print(f"\n" + "=" * 60)
+            print("特征准备完成 - 详细信息")
+            print("=" * 60)
+            print(f"特征形状: {features_recent.shape}")
+            print(f"使用的期号范围: {df.iloc[start_idx]['期号']} 到 {df.iloc[-1]['期号']}")
             
-            # 显示用于预测的数据（显示最近10期）
-            print(f"\n用于预测的数据（最近 {model_seq_length} 期）:")
-            start_idx = max(0, len(df) - model_seq_length)
-            for i in range(start_idx, len(df)):
-                red = [df.iloc[i][f'红球{j+1}'] for j in range(6)]
-                blue = df.iloc[i]['蓝球']
-                period = df.iloc[i]['期号'] if '期号' in df.columns else f"第{i+1}期"
-                print(f"  {period}: 红球{red}, 蓝球{blue}")
+            # 显示每期的基础号码特征（前7个是红球+蓝球）
+            print(f"\n最近 {model_seq_length} 期的号码特征（标准化后）:")
+            for i in range(model_seq_length):
+                period_idx = start_idx + i
+                period = df.iloc[period_idx]['期号']
+                # 前7个特征是红球和蓝球的标准化值
+                print(f"  期号 {period}: 特征前7维 = {features_recent[i, :7]}")
             
-            sequence = features_scaled.reshape(1, model_seq_length, -1)
+            # 计算特征的哈希值以便确认是否变化
+            import hashlib
+            feature_hash = hashlib.md5(features_recent.tobytes()).hexdigest()[:8]
+            print(f"\n特征数据哈希值（前8位）: {feature_hash}")
+            print("注意: 如果数据更新后哈希值变化，说明特征确实在变化")
+            print("      但模型输出可能仍然相似，因为模型权重是固定的")
+            
+            # 显示模型文件信息
+            if os.path.exists(self.model_file):
+                import datetime
+                mtime = os.path.getmtime(self.model_file)
+                mtime_str = datetime.datetime.fromtimestamp(mtime).strftime('%Y-%m-%d %H:%M:%S')
+                print(f"\n当前使用的模型文件: {self.model_file}")
+                print(f"模型最后训练时间: {mtime_str}")
+                print("⚠️  关键: 即使输入数据变化，模型权重是固定的，所以预测结果可能相似")
+            print("=" * 60)
+            
+            sequence = features_recent.reshape(1, model_seq_length, -1)
         else:
             if not os.path.exists(self.processed_data_file):
                 raise FileNotFoundError(f"处理后的数据文件不存在")
@@ -898,19 +954,101 @@ class SSQLSTMModel10:
                     print(f"{idx+1}({prob:.3f}) ", end="")
                 print()
             
-            # ========== 直接根据训练结果选择（无限制）==========
-            # 每个位置直接选择概率最高的号码，不处理重复
-            print("\n正在生成预测结果（完全根据训练结果，每个位置选择概率最高的号码）...")
-            red_balls = []
-            for i in range(6):
-                prob_dist = predictions[i][0]
-                # 直接选择概率最高的号码
-                best_idx = np.argmax(prob_dist)
-                red_balls.append(best_idx + 1)  # 转换为1-33
+            # ========== 改进的预测策略：基于全局概率分布选择 ==========
+            print("\n" + "=" * 60)
+            print("预测策略说明:")
+            print("=" * 60)
+            print("✓ 训练逻辑: 用第1-10期预测第11期，第2-11期预测第12期...")
+            print("✓ 预测逻辑: 用最近10期预测下一期")
+            print("✓ 选择策略: 基于模型输出的概率分布，选择全局概率最高的6个号码")
+            print("=" * 60)
+            print("\n正在生成预测结果（基于模型概率分布，确保号码不重复）...")
             
-            red_balls = sorted(red_balls)
+            def global_probability_selection(predictions):
+                """
+                基于全局概率分布的选择策略：
+                1. 计算每个号码在所有6个位置的平均概率（全局热度）
+                2. 从高到低选择6个不重复的号码
+                3. 这样更符合"根据前10期预测第11期"的逻辑
+                """
+                # 计算每个号码在所有位置的平均概率
+                global_probs = np.zeros(33)
+                for i in range(6):
+                    prob_dist = predictions[i][0]
+                    global_probs += prob_dist
+                global_probs = global_probs / 6  # 平均概率
+                
+                # 按全局概率从高到低排序
+                sorted_indices = np.argsort(global_probs)[::-1]
+                
+                # 显示Top-10全局概率
+                print("\n全局概率Top-10（模型认为最可能出现的号码）:")
+                for rank, idx in enumerate(sorted_indices[:10], 1):
+                    ball = idx + 1
+                    prob = global_probs[idx]
+                    print(f"  {rank}. 号码{ball:2d}: {prob:.4f} ({prob*100:.2f}%)")
+                
+                # 选择前6个不重复的号码
+                red_balls = []
+                for idx in sorted_indices:
+                    ball = idx + 1
+                    if len(red_balls) < 6:
+                        red_balls.append(ball)
+                    else:
+                        break
+                
+                return sorted(red_balls)
             
-            # 蓝球预测：直接根据训练结果选择概率最高的号码（无限制）
+            def position_based_selection_with_diversity(predictions, k=3):
+                """
+                位置对应 + 多样性策略：
+                1. 每个位置从Top-K中选择
+                2. 确保6个号码不重复
+                3. 增加随机性，避免总是选相同的组合
+                """
+                red_balls = []
+                used_numbers = set()
+                
+                # 按位置顺序选择
+                for pos in range(6):
+                    prob_dist = predictions[pos][0]
+                    
+                    # 获取Top-K候选
+                    top_k_indices = np.argsort(prob_dist)[-k:][::-1]
+                    top_k_probs = prob_dist[top_k_indices]
+                    
+                    # 归一化概率
+                    top_k_probs = top_k_probs / top_k_probs.sum()
+                    
+                    # 从Top-K中按概率权重随机选择未使用的号码
+                    selected = False
+                    for idx, prob in zip(top_k_indices, top_k_probs):
+                        ball = idx + 1
+                        if ball not in used_numbers:
+                            # 使用概率权重，但增加随机性
+                            if np.random.random() < prob * 1.5:  # 增加选中概率
+                                red_balls.append(ball)
+                                used_numbers.add(ball)
+                                selected = True
+                                break
+                    
+                    # 如果Top-K都没选中，选择概率最高的未使用号码
+                    if not selected:
+                        available_indices = [i for i in range(33) if (i+1) not in used_numbers]
+                        if available_indices:
+                            best_idx = max(available_indices, key=lambda x: prob_dist[x])
+                            red_balls.append(best_idx + 1)
+                            used_numbers.add(best_idx + 1)
+                        else:
+                            best_idx = np.argmax(prob_dist)
+                            red_balls.append(best_idx + 1)
+                
+                return sorted(red_balls)
+            
+            # 使用全局概率策略（更符合"根据前10期预测第11期"的逻辑）
+            red_balls = global_probability_selection(predictions)
+            
+            # 蓝球预测：使用Top-K采样，增加多样性
             blue_prob_dist = predictions[6][0]
             
             print(f"\n蓝球预测信息:")
@@ -921,11 +1059,20 @@ class SSQLSTMModel10:
                 print(f"{idx+1}({prob:.3f}) ", end="")
             print()
             
-            # 直接选择概率最高的号码，不使用任何采样策略
-            blue_ball = np.argmax(blue_prob_dist) + 1
-            max_prob = blue_prob_dist[blue_ball - 1]
-            print(f"  策略: 完全根据训练结果，选择概率最高的号码")
-            print(f"  最终预测: {blue_ball} (概率: {max_prob:.4f} ({max_prob*100:.2f}%))")
+            # 使用Top-3加权采样，增加多样性
+            top3_indices = top5_indices[:3]
+            top3_probs = blue_prob_dist[top3_indices]
+            top3_probs = top3_probs / top3_probs.sum()  # 归一化
+            
+            if random_seed is not None:
+                np.random.seed(random_seed)
+            else:
+                np.random.seed(int(time.time()) % 10000)  # 使用时间戳作为随机种子
+            
+            blue_ball = np.random.choice(top3_indices + 1, p=top3_probs)
+            selected_prob = blue_prob_dist[blue_ball - 1]
+            print(f"  策略: Top-3加权采样（增加预测多样性）")
+            print(f"  最终预测: {blue_ball} (概率: {selected_prob:.4f} ({selected_prob*100:.2f}%))")
             
             # 返回单个结果
             return {

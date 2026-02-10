@@ -13,17 +13,18 @@ from datetime import datetime
 
 class SSQDataFetcher500Com:
     def __init__(self, max_retries=3, retry_delay=2):
-        self.base_url = "http://kaijiang.500.com/ssq.shtml"
+        # 使用官方API（更稳定可靠）
+        self.official_api = "http://www.cwl.gov.cn/cwl_admin/front/cwlkj/search/kjxx/findDrawNotice"
+        self.base_url = "http://kaijiang.500.com/ssq.shtml"  # 备用数据源
         self.data_file = "ssq_history.csv"
         self.max_retries = max_retries  # 最大重试次数
         self.retry_delay = retry_delay  # 重试延迟（秒）
         self.headers = {
             'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
-            'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8',
+            'Accept': 'application/json, text/html, */*',
             'Accept-Language': 'zh-CN,zh;q=0.9,en;q=0.8',
             'Accept-Encoding': 'gzip, deflate',
             'Connection': 'keep-alive',
-            'Referer': 'http://kaijiang.500.com/ssq.shtml',
         }
         self.failed_urls = []  # 记录失败的URL，最后重试
         
@@ -198,6 +199,109 @@ class SSQDataFetcher500Com:
             # 写入数据
             f.write(f"{data['期号']},{data['开奖日期']},{data['红球1']},{data['红球2']},{data['红球3']},{data['红球4']},{data['红球5']},{data['红球6']},{data['蓝球']}\n")
     
+    def fetch_from_official_api(self):
+        """
+        从官方API获取数据（优先使用，更稳定）
+        """
+        print("尝试从官方API获取数据...")
+        
+        try:
+            params = {
+                'name': 'ssq',
+                'issueCount': '',
+                'pageNo': '1',
+                'pageSize': '9999',
+                'systemType': 'PC'
+            }
+            
+            response = requests.get(self.official_api, params=params, headers=self.headers, timeout=15)
+            
+            if response.status_code == 200:
+                data = response.json()
+                if data.get('result'):
+                    results = data['result']
+                    print(f"从官方API获取到 {len(results)} 条数据")
+                    
+                    data_list = []
+                    for item in results:
+                        try:
+                            period = item.get('code', '')
+                            red_str = item.get('red', '')
+                            blue_str = item.get('blue', '')
+                            
+                            if not period or not red_str or not blue_str:
+                                continue
+                            
+                            # 解析红球（逗号分隔，如 "01,03,05,18,29,32"）
+                            red_nums = [x.strip() for x in red_str.split(',')]
+                            if len(red_nums) >= 6:
+                                red_balls = [int(x) for x in red_nums[:6]]
+                            else:
+                                continue
+                            
+                            # 解析蓝球
+                            blue_nums = re.findall(r'\d+', blue_str)
+                            if blue_nums:
+                                blue_ball = int(blue_nums[0])
+                            else:
+                                continue
+                            
+                            # 验证数据
+                            if len(set(red_balls)) != 6 or any(r < 1 or r > 33 for r in red_balls):
+                                continue
+                            if blue_ball < 1 or blue_ball > 16:
+                                continue
+                            
+                            red_balls.sort()
+                            
+                            # 清理日期格式（移除星期）
+                            date = item.get('date', '').replace('(日)', '').replace('(一)', '').replace('(二)', '').replace('(三)', '').replace('(四)', '').replace('(五)', '').replace('(六)', '')
+                            
+                            data_list.append({
+                                '期号': period,
+                                '开奖日期': date,
+                                '红球1': str(red_balls[0]),
+                                '红球2': str(red_balls[1]),
+                                '红球3': str(red_balls[2]),
+                                '红球4': str(red_balls[3]),
+                                '红球5': str(red_balls[4]),
+                                '红球6': str(red_balls[5]),
+                                '蓝球': str(blue_ball)
+                            })
+                        except Exception as e:
+                            continue
+                    
+                    if data_list:
+                        # 写入数据
+                        new_count = 0
+                        existing_periods = set()
+                        
+                        # 读取已有期号
+                        if os.path.exists(self.data_file):
+                            try:
+                                with open(self.data_file, 'r', encoding='utf-8-sig') as f:
+                                    lines = f.readlines()
+                                    for line in lines[1:]:
+                                        parts = line.strip().split(',')
+                                        if parts:
+                                            existing_periods.add(parts[0])
+                            except:
+                                pass
+                        
+                        # 写入新数据
+                        for data in data_list:
+                            if data['期号'] not in existing_periods:
+                                self.write_to_csv(data)
+                                new_count += 1
+                        
+                        print(f"✓ 成功从官方API获取并写入 {new_count} 条新数据")
+                        return True
+                        
+        except Exception as e:
+            print(f"从官方API获取数据失败: {e}")
+        
+        return False
+    
     def turn_page(self):
         """
         获取所有期号列表并下载数据
@@ -298,7 +402,15 @@ class SSQDataFetcher500Com:
     def fetch_all(self):
         """
         获取所有历史数据的主方法
+        优先使用官方API，失败则使用500.com
         """
+        # 优先使用官方API
+        if self.fetch_from_official_api():
+            print("\n✓ 使用官方API成功获取数据")
+            return
+        
+        # 如果官方API失败，使用500.com作为备用
+        print("\n官方API不可用，使用500.com作为备用数据源...")
         self.turn_page()
 
 
